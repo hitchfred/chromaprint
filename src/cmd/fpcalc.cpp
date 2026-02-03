@@ -29,6 +29,7 @@ static bool g_overlap = false;
 static bool g_raw = false;
 static bool g_signed = false;
 static bool g_abs_ts = false;
+static bool g_simhash = false;
 static bool g_ignore_errors = false;
 static ChromaprintAlgorithm g_algorithm = CHROMAPRINT_ALGORITHM_DEFAULT;
 
@@ -49,6 +50,7 @@ const char *g_help =
 	"  -ts            Output UNIX timestamps for chunked results, useful when fingerprinting real-time audio stream\n"
 	"  -raw           Output fingerprints in the uncompressed format\n"
 	"  -signed        Change the uncompressed format from unsigned integers to signed (for pg_acoustid compatibility)\n"
+	"  -simhash       Include the 32-bit SimHash for the fingerprint in the output\n"
 	"  -json          Print the output in JSON format\n"
 	"  -text          Print the output in text format\n"
 	"  -plain         Print the just the fingerprint in text format\n"
@@ -125,6 +127,8 @@ static void ParseOptions(int &argc, char **argv) {
 			g_signed = true;
 		} else if (!strcmp(argv[i], "-ignore-errors")) {
 			g_ignore_errors = true;
+		} else if (!strcmp(argv[i], "-simhash")) {
+			g_simhash = true;
 		} else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "-version")) {
 #if defined(USE_SWRESAMPLE)
 #define RESAMPLE_LIB_IDENT_IDENT LIBSWRESAMPLE_IDENT
@@ -153,10 +157,26 @@ static void ParseOptions(int &argc, char **argv) {
 	argc = j;
 }
 
+static std::string FormatRaw(const uint32_t *data, int size) {
+	std::stringstream ss;
+	for (int i = 0; i < size; i++) {
+		if (i > 0) {
+			ss << ',';
+		}
+		if (g_signed) {
+			ss << static_cast<int32_t>(data[i]);
+		} else {
+			ss << data[i];
+		}
+	}
+	return ss.str();
+}
+
 void PrintResult(ChromaprintContext *ctx, FFmpegAudioReader &reader, bool first, double timestamp, double duration) {
 	std::string tmp_fp;
-	const char *fp;
+	const char *fp = nullptr;
 	bool dealloc_fp = false;
+	uint32_t simhash = 0;
 
 	int size;
 	if (!chromaprint_get_raw_fingerprint_size(ctx, &size)) {
@@ -171,8 +191,7 @@ void PrintResult(ChromaprintContext *ctx, FFmpegAudioReader &reader, bool first,
 		return;
 	}
 
-	if (g_raw) {
-		std::stringstream ss;
+	if (g_raw || g_simhash) {
 		uint32_t *raw_fp_data = nullptr;
 		int raw_fp_size = 0;
 		if (!chromaprint_get_raw_fingerprint(ctx, &raw_fp_data, &raw_fp_size)) {
@@ -180,19 +199,16 @@ void PrintResult(ChromaprintContext *ctx, FFmpegAudioReader &reader, bool first,
 			exit(2);
 		}
 		SCOPE_EXIT(chromaprint_dealloc(raw_fp_data));
-		for (int i = 0; i < raw_fp_size; i++) {
-			if (i > 0) {
-				ss << ',';
-			}
-            if (g_signed) {
-                ss << static_cast<int32_t>(raw_fp_data[i]);
-            } else {
-                ss << raw_fp_data[i];
-            }
+		if (g_raw) {
+			tmp_fp = FormatRaw(raw_fp_data, raw_fp_size);
+			fp = tmp_fp.c_str();
 		}
-		tmp_fp = ss.str();
-		fp = tmp_fp.c_str();
-	} else {
+		if (g_simhash && !chromaprint_hash_fingerprint(raw_fp_data, raw_fp_size, &simhash)) {
+			fprintf(stderr, "ERROR: Could not compute SimHash\n");
+			exit(2);
+		}
+	}
+	if (!g_raw) {
 		char *tmp_fp2;
 		if (!chromaprint_get_fingerprint(ctx, &tmp_fp2)) {
 			fprintf(stderr, "ERROR: Could not get the fingerprinting\n");
@@ -220,21 +236,24 @@ void PrintResult(ChromaprintContext *ctx, FFmpegAudioReader &reader, bool first,
 			if (g_abs_ts) {
 				printf("TIMESTAMP=%.2f\n", timestamp);
 			}
+			if (g_simhash) {
+				printf("SIMHASH=%" PRIu32 "\n", simhash);
+			}
 			printf("DURATION=%d\nFINGERPRINT=%s\n", int(duration), fp);
 			break;
 		case JSON:
-			if (g_max_chunk_duration != 0) {
-				if (g_raw) {
-					printf("{\"timestamp\": %.2f, \"duration\": %.2f, \"fingerprint\": [%s]}\n", timestamp, duration, fp);
-				} else {
-					printf("{\"timestamp\": %.2f, \"duration\": %.2f, \"fingerprint\": \"%s\"}\n", timestamp, duration, fp);
-				}
+			printf("{");
+			if (g_max_chunk_duration) {
+				printf("\"timestamp\": %.2f, ", timestamp);
+			}
+			if (g_simhash) {
+				printf("\"simhash\": %" PRIu32 ", ", simhash);
+			}
+			printf("\"duration\": %.2f, ", duration);
+			if (g_raw) {
+				printf("\"fingerprint\": [%s]}\n", fp);
 			} else {
-				if (g_raw) {
-					printf("{\"duration\": %.2f, \"fingerprint\": [%s]}\n", duration, fp);
-				} else {
-					printf("{\"duration\": %.2f, \"fingerprint\": \"%s\"}\n", duration, fp);
-				}
+				printf("\"fingerprint\": \"%s\"}\n", fp);
 			}
 			break;
 		case PLAIN:
